@@ -13,6 +13,9 @@ import { join } from 'path';
 import { ServeStaticModule } from '@nestjs/serve-static';
 import { RestocksModule } from './restocks/restocks.module';
 import { ReceiptsModule } from './receipts/receipts.module';
+import { StatsModule } from './stats/stats.module';
+import { SuppliersModule } from './suppliers/suppliers.module';
+import { CashboxesModule } from './cashboxes/cashboxes.module';
 
 @Module({
   imports: [
@@ -44,6 +47,9 @@ import { ReceiptsModule } from './receipts/receipts.module';
     RollsModule,
     RestocksModule,
     ReceiptsModule,
+    StatsModule,
+    SuppliersModule,
+    CashboxesModule,
   ],
 })
 export class AppModule {}

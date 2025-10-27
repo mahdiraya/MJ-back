@@ -17,6 +17,7 @@ import { UpdateTransactionDto } from './update-transaction.dto';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { RolesGuard } from '../auth/roles.guard';
 import { Roles } from '../auth/roles.decorator';
+import { TransactionMovementsQueryDto } from './dto/transaction-movements.query.dto';
 
 @UseGuards(JwtAuthGuard, RolesGuard)
 @Controller('transactions')
@@ -27,6 +28,11 @@ export class TransactionsController extends BaseController<
 > {
   constructor(private readonly transactionsService: TransactionsService) {
     super(transactionsService);
+  }
+
+  @Get('movements')
+  listMovements(@Query() query: TransactionMovementsQueryDto) {
+    return this.transactionsService.listMovements(query);
   }
 
   /** Override default list: include user & customer so UI can display names */

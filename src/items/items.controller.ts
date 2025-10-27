@@ -8,6 +8,8 @@ import {
   UploadedFile,
   ParseIntPipe,
   BadRequestException,
+  Get,
+  Query,
 } from '@nestjs/common';
 import { ItemsService } from './items.service';
 import { BaseController } from '../base/base.controller';
@@ -17,6 +19,7 @@ import { UpdateItemDto } from './update-item.dto';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { RolesGuard } from '../auth/roles.guard';
 import { Roles } from '../auth/roles.decorator';
+import { LowStockQueryDto } from './dto/low-stock.query.dto';
 
 import { FileInterceptor } from '@nestjs/platform-express';
 import { diskStorage } from 'multer';
@@ -33,6 +36,11 @@ export class ItemsController extends BaseController<
 > {
   constructor(private readonly itemsService: ItemsService) {
     super(itemsService);
+  }
+
+  @Get('low-stock')
+  getLowStock(@Query() query: LowStockQueryDto) {
+    return this.itemsService.findLowStock(query);
   }
 
   /** Upload/replace an item's photo */

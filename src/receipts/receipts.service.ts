@@ -11,6 +11,8 @@ type UnifiedReceiptRow = {
   mode: UnifiedMode;
   date: Date | null; // kept as Date|null; frontend can coerce to string if desired
   total: number;
+  paid: number;
+  statusCode?: 'PAID' | 'PARTIAL' | 'UNPAID';
   user: { id: number; name?: string } | null;
   party: { id: number; name?: string } | null; // customer (OUT) or { id } (IN) for now
   rawId: number;
@@ -31,65 +33,135 @@ export class ReceiptsService {
   }
 
   async listUnified(limit = 200): Promise<UnifiedReceiptRow[]> {
-    const [outs, ins] = await Promise.all([
-      this.txRepo.find({
-        relations: ['user', 'customer'],
-        order: { date: 'DESC' },
-        take: limit,
-      }),
-      this.rsRepo.find({
-        relations: ['user'], // Restock has user; supplierId is just a number for now
-        order: { date: 'DESC' },
-        take: limit,
-      }),
-    ]);
+    const outsRaw = await this.txRepo
+      .createQueryBuilder('t')
+      .leftJoin('t.user', 'user')
+      .leftJoin('t.customer', 'customer')
+      .leftJoin('t.payments', 'pay')
+      .select('t.id', 'id')
+      .addSelect('t.date', 'date')
+      .addSelect('t.total', 'total')
+      .addSelect('t.receipt_type', 'type')
+      .addSelect('t.status', 'status')
+      .addSelect('user.id', 'userId')
+      .addSelect('user.name', 'userName')
+      .addSelect('user.username', 'userUsername')
+      .addSelect('customer.id', 'customerId')
+      .addSelect('customer.name', 'customerName')
+      .addSelect(
+        `COALESCE(SUM(CASE WHEN pay.kind = 'sale' THEN pay.amount ELSE 0 END), 0)`,
+        'paid',
+      )
+      .orderBy('t.date', 'DESC')
+      .addOrderBy('t.id', 'DESC')
+      .limit(limit)
+      .groupBy('t.id')
+      .addGroupBy('user.id')
+      .addGroupBy('customer.id')
+      .addGroupBy('user.name')
+      .addGroupBy('user.username')
+      .addGroupBy('customer.name')
+      .addGroupBy('t.total')
+      .addGroupBy('t.receipt_type')
+      .addGroupBy('t.status')
+      .getRawMany<{
+        id: number;
+        date: Date | null;
+        total: string;
+        type: string;
+        status: 'PAID' | 'PARTIAL' | 'UNPAID' | null;
+        paid: string;
+        userId: number | null;
+        userName: string | null;
+        userUsername: string | null;
+        customerId: number | null;
+        customerName: string | null;
+      }>();
 
-    const mappedOut: UnifiedReceiptRow[] = outs.map((t) => ({
-      id: `OUT-${t.id}`,
+    const insRaw = await this.rsRepo
+      .createQueryBuilder('r')
+      .leftJoin('r.user', 'user')
+      .leftJoin('r.payments', 'pay')
+      .select('r.id', 'id')
+      .addSelect('COALESCE(r.date, r.created_at)', 'date')
+      .addSelect('r.total', 'total')
+      .addSelect('r.status', 'status')
+      .addSelect('r.supplierId', 'supplierId')
+      .addSelect('user.id', 'userId')
+      .addSelect('user.name', 'userName')
+      .addSelect('user.username', 'userUsername')
+      .addSelect(
+        `COALESCE(SUM(CASE WHEN pay.kind = 'restock' THEN pay.amount ELSE 0 END), 0)`,
+        'paid',
+      )
+      .orderBy('date', 'DESC')
+      .addOrderBy('r.id', 'DESC')
+      .limit(limit)
+      .groupBy('r.id')
+      .addGroupBy('user.id')
+      .addGroupBy('user.name')
+      .addGroupBy('user.username')
+      .addGroupBy('r.supplierId')
+      .addGroupBy('r.total')
+      .addGroupBy('r.status')
+      .getRawMany<{
+        id: number;
+        date: Date | null;
+        total: string;
+        status: 'PAID' | 'PARTIAL' | 'UNPAID' | null;
+        supplierId: number | null;
+        paid: string;
+        userId: number | null;
+        userName: string | null;
+        userUsername: string | null;
+      }>();
+
+    const mappedOut: UnifiedReceiptRow[] = outsRaw.map((row) => ({
+      id: `OUT-${row.id}`,
       mode: 'OUT',
-      date: (t as any).date ?? null,
-      total: Number((t as any).total ?? 0),
-      user: (t as any).user
+      date: row.date ?? null,
+      total: Number(row.total || 0),
+      paid: Number(row.paid || 0),
+      statusCode: row.status ?? undefined,
+      user: row.userId
         ? {
-            id: Number((t as any).user.id),
-            name: (t as any).user.name || (t as any).user.username,
+            id: Number(row.userId),
+            name: row.userName || row.userUsername || undefined,
           }
         : null,
-      party: (t as any).customer
+      party: row.customerId
         ? {
-            id: Number((t as any).customer.id),
-            name: (t as any).customer.name,
+            id: Number(row.customerId),
+            name: row.customerName ?? undefined,
           }
         : null,
-      rawId: t.id,
-      type: (t as any).receipt_type ?? 'simple',
+      rawId: Number(row.id),
+      type: row.type ?? 'simple',
     }));
 
-    const mappedIn: UnifiedReceiptRow[] = ins.map((r) => {
-      // Prefer explicit date; fall back to created_at so it always sorts/prints
-      const date: Date | null =
-        ((r as any).date as Date | null) ??
-        ((r as any).created_at as Date | null) ??
-        null;
-      return {
-        id: `IN-${r.id}`,
-        mode: 'IN',
-        date,
-        total: Number((r as any).total ?? 0),
-        user: (r as any).user
+    const mappedIn: UnifiedReceiptRow[] = insRaw.map((row) => ({
+      id: `IN-${row.id}`,
+      mode: 'IN',
+      date: row.date ?? null,
+      total: Number(row.total || 0),
+      paid: Number(row.paid || 0),
+      statusCode: row.status ?? undefined,
+      user: row.userId
+        ? {
+            id: Number(row.userId),
+            name: row.userName || row.userUsername || undefined,
+          }
+        : null,
+      party:
+        row.supplierId != null
           ? {
-              id: Number((r as any).user.id),
-              name: (r as any).user.name || (r as any).user.username,
+              id: Number(row.supplierId),
+              name: undefined,
             }
           : null,
-        party:
-          (r as any).supplierId != null
-            ? { id: Number((r as any).supplierId) }
-            : null,
-        rawId: r.id,
-        type: 'restock',
-      };
-    });
+      rawId: Number(row.id),
+      type: 'restock',
+    }));
 
     return [...mappedOut, ...mappedIn]
       .sort((a, b) => this.toTs(b.date) - this.toTs(a.date))

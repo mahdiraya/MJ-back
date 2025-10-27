@@ -13,6 +13,7 @@ import {
   ValidateNested,
   IsString,
 } from 'class-validator';
+import { ReceiptStatus } from '../entities/restock.entity';
 
 // Matches your Item entity
 export type ItemCategory = 'internet' | 'solar' | 'camera' | 'satellite';
@@ -102,6 +103,11 @@ export class CreateRestockDto {
   supplier?: number;
 
   @IsOptional()
+  @IsString()
+  @IsNotEmpty()
+  supplierName?: string;
+
+  @IsOptional()
   @IsDateString()
   date?: string;
 
@@ -119,4 +125,31 @@ export class CreateRestockDto {
   @Type(() => RestockLineDto)
   @ArrayMinSize(1)
   items!: RestockLineDto[];
+
+  @Type(() => Number)
+  @IsOptional()
+  @IsNumber({ maxDecimalPlaces: 2 })
+  @Min(0)
+  paid?: number;
+
+  @Type(() => Number)
+  @IsOptional()
+  @IsInt()
+  cashboxId?: number;
+
+  @IsOptional()
+  @IsString()
+  cashboxCode?: string;
+
+  @IsOptional()
+  @IsIn(['PAID', 'PARTIAL', 'UNPAID'])
+  statusOverride?: ReceiptStatus;
+
+  @IsOptional()
+  @IsString()
+  statusOverrideNote?: string;
+
+  @IsOptional()
+  @IsDateString()
+  paymentDate?: string;
 }

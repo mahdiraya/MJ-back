@@ -10,16 +10,28 @@ import { DataSource, In, Repository, DeepPartial } from 'typeorm';
 import { REQUEST } from '@nestjs/core';
 import { Request } from 'express';
 
-import { Restock } from '../entities/restock.entity';
+import { Restock, ReceiptStatus } from '../entities/restock.entity';
 import { RestockItem } from '../entities/restock-item.entity';
 import { Item } from '../entities/item.entity';
 import { Roll } from '../entities/roll.entity';
+import { Cashbox } from '../entities/cashbox.entity';
 import {
   CreateRestockDto,
   RestockLineDto,
   NewItemDto,
 } from './create-restock.dto';
 import { Payment } from '../entities/payment.entity';
+import { CashboxEntry } from '../entities/cashbox-entry.entity';
+import { Supplier } from '../entities/supplier.entity';
+import {
+  extractManualStatus,
+  resolveCashboxFromDto,
+  computeReceiptStatus,
+  ManualStatusState,
+} from '../payments/payment.helpers';
+import { RestockMovementsQueryDto } from './dto/restock-movements.query.dto';
+
+const RECEIPT_STATUSES = ['PAID', 'PARTIAL', 'UNPAID'] as const;
 
 @Injectable({ scope: Scope.REQUEST })
 export class RestocksService {
@@ -178,14 +190,76 @@ export class RestocksService {
 
       const tax = this.num2(dto.tax ?? 0);
       const total = this.num2(subtotal + tax);
+      const manual = extractManualStatus<ReceiptStatus>(
+        dto as Record<string, any>,
+        RECEIPT_STATUSES,
+      );
+      const manualSetAt = manual.enabled ? new Date() : null;
+      const paidParam = this.num2(
+        Number(
+          dto.paid ??
+            (dto as any).paidAmount ??
+            (dto as any).amountPaid ??
+            0,
+        ),
+      );
+      const initialStatus = computeReceiptStatus<ReceiptStatus>(
+        paidParam,
+        total,
+        manual,
+        (n) => this.num2(n),
+        RECEIPT_STATUSES,
+      );
+
+      const supplierRepo = manager.getRepository(Supplier);
+      const trimmedSupplierName = (dto as any).supplierName
+        ? String((dto as any).supplierName).trim()
+        : '';
+      let supplierEntity: Supplier | null = null;
+
+      if (dto.supplier != null) {
+        supplierEntity = await supplierRepo.findOne({
+          where: { id: Number(dto.supplier) },
+        });
+        if (!supplierEntity) {
+          throw new BadRequestException('Supplier not found.');
+        }
+      }
+
+      if (!supplierEntity) {
+        if (!trimmedSupplierName) {
+          throw new BadRequestException('Supplier name is required.');
+        }
+        supplierEntity = await supplierRepo
+          .createQueryBuilder('s')
+          .where('LOWER(s.name) = :name', {
+            name: trimmedSupplierName.toLowerCase(),
+          })
+          .getOne();
+        if (!supplierEntity) {
+          supplierEntity = supplierRepo.create({
+            name: trimmedSupplierName,
+          } as DeepPartial<Supplier>);
+          supplierEntity = await supplierRepo.save(supplierEntity);
+        }
+      }
+
+      const supplierInfo = supplierEntity
+        ? { id: supplierEntity.id, name: supplierEntity.name }
+        : { id: null, name: null };
 
       const restock = manager.getRepository(Restock).create({
         date: dto.date ? new Date(dto.date) : new Date(),
-        supplierId: (dto as any).supplier ?? null,
+        supplierId: supplierInfo.id ?? null,
         note: dto.note ?? null,
         subtotal,
         tax,
         total,
+        status: initialStatus,
+        statusManualEnabled: manual.enabled,
+        statusManualValue: manual.value ?? null,
+        statusManualNote: manual.note,
+        statusManualSetAt: manualSetAt,
         user: this.resolveUserId()
           ? ({ id: this.resolveUserId()! } as any)
           : null,
@@ -201,22 +275,44 @@ export class RestocksService {
       }
 
       // === NEW: capture optional payment for this purchase ===
-      const paidParam = this.num2(
-        Number(
-          (dto as any).paid ??
-            (dto as any).paidAmount ??
-            (dto as any).amountPaid ??
-            0,
-        ),
-      );
+      let paymentCashbox: Cashbox | null = null;
       if (paidParam > 0) {
+        paymentCashbox = await resolveCashboxFromDto(
+          manager,
+          dto as Record<string, any>,
+        );
+        if (!paymentCashbox) {
+          throw new BadRequestException(
+            'Providing a payment requires a valid cashbox.',
+          );
+        }
         const payEntity = manager.getRepository(Payment).create({
           kind: 'restock',
           amount: paidParam,
           restock: { id: saved.id } as any,
           note: (dto as any).paymentNote ?? null,
+          cashbox: { id: paymentCashbox.id } as any,
         } as DeepPartial<Payment>);
-        await manager.getRepository(Payment).save(payEntity);
+        const savedPayment = await manager
+          .getRepository(Payment)
+          .save(payEntity);
+
+        const entryRepo = manager.getRepository(CashboxEntry);
+        const entry = entryRepo.create({
+          cashbox: { id: paymentCashbox.id } as any,
+          kind: 'payment',
+          direction: 'out',
+          amount: paidParam,
+          payment: { id: savedPayment.id } as any,
+          referenceType: 'restock',
+          referenceId: saved.id,
+          occurredAt: dto.paymentDate ? new Date(dto.paymentDate) : new Date(),
+          note:
+            (dto as any).cashboxNote ??
+            (dto as any).paymentNote ??
+            null,
+        });
+        await entryRepo.save(entry);
       }
 
       // Compute paid/status for the restock
@@ -230,8 +326,6 @@ export class RestocksService {
         .getRawOne<{ sum?: string }>();
 
       const paid = this.num2(Number(paidRow?.sum ?? 0));
-      const status: 'paid' | 'partial' | 'unpaid' =
-        paid >= total ? 'paid' : paid > 0 ? 'partial' : 'unpaid';
 
       const full = await manager.getRepository(Restock).findOne({
         where: { id: saved.id },
@@ -239,7 +333,179 @@ export class RestocksService {
       });
       if (!full) throw new NotFoundException('Restock not found after save');
 
-      return { ...full, paid, status };
+      const manualState: ManualStatusState<ReceiptStatus> = {
+        enabled: !!full.statusManualEnabled,
+        value: full.statusManualValue,
+        note: full.statusManualNote ?? null,
+      };
+      const effectiveStatus = computeReceiptStatus<ReceiptStatus>(
+        paid,
+        full.total ?? total,
+        manualState,
+        (n) => this.num2(n),
+        RECEIPT_STATUSES,
+      );
+
+      if (full.status !== effectiveStatus) {
+        await manager
+          .getRepository(Restock)
+          .update(full.id, { status: effectiveStatus });
+        full.status = effectiveStatus;
+      }
+
+      const statusLabel = effectiveStatus.toLowerCase() as
+        | 'paid'
+        | 'partial'
+        | 'unpaid';
+
+      return {
+        ...full,
+        paid,
+        status: statusLabel,
+        statusCode: effectiveStatus,
+        statusManualEnabled: full.statusManualEnabled,
+        statusManualValue: full.statusManualValue,
+        statusManualNote: full.statusManualNote,
+        statusManualSetAt: full.statusManualSetAt,
+        supplierName: supplierInfo.name ?? null,
+      };
+    });
+  }
+
+  async listMovements(
+    filters: RestockMovementsQueryDto,
+  ): Promise<
+    Array<{
+      id: number;
+      date: string | null;
+      supplierId: number | null;
+      supplierName: string | null;
+      total: number;
+      tax: number | null;
+      paid: number;
+      outstanding: number;
+      status: ReceiptStatus;
+      cashboxes: string[];
+      user: { id: number; name?: string | null; username?: string | null } | null;
+    }>
+  > {
+    const qb = this.restockRepo
+      .createQueryBuilder('r')
+      .leftJoin(Supplier, 's', 's.id = r.supplierId')
+      .leftJoin('r.user', 'user')
+      .leftJoin('r.payments', 'pay')
+      .leftJoin('pay.cashbox', 'cashbox')
+      .select('r.id', 'id')
+      .addSelect('COALESCE(r.date, r.created_at)', 'date')
+      .addSelect('r.supplierId', 'supplierId')
+      .addSelect('s.name', 'supplierName')
+      .addSelect('r.total', 'total')
+      .addSelect('r.tax', 'tax')
+      .addSelect('r.status', 'status')
+      .addSelect('user.id', 'userId')
+      .addSelect('user.name', 'userName')
+      .addSelect('user.username', 'userUsername')
+      .addSelect('COALESCE(SUM(pay.amount), 0)', 'paid')
+      .addSelect(
+        "GROUP_CONCAT(DISTINCT cashbox.code SEPARATOR ',')",
+        'cashboxes',
+      )
+      .groupBy('r.id')
+      .addGroupBy('date')
+      .addGroupBy('r.supplierId')
+      .addGroupBy('supplierName')
+      .addGroupBy('r.total')
+      .addGroupBy('r.tax')
+      .addGroupBy('r.status')
+      .addGroupBy('user.id')
+      .addGroupBy('user.name')
+      .addGroupBy('user.username')
+      .orderBy('date', 'DESC')
+      .addOrderBy('r.id', 'DESC');
+
+    if (filters.supplierId != null) {
+      qb.andWhere('r.supplierId = :supplierId', {
+        supplierId: Number(filters.supplierId),
+      });
+    }
+
+    if (filters.status) {
+      qb.andWhere('r.status = :status', { status: filters.status });
+    }
+
+    if (filters.cashboxCode) {
+      qb.andWhere('cashbox.code = :cashboxCode', {
+        cashboxCode: filters.cashboxCode.toUpperCase(),
+      });
+    }
+
+    if (filters.startDate) {
+      qb.andWhere('COALESCE(r.date, r.created_at) >= :startDate', {
+        startDate: filters.startDate,
+      });
+    }
+
+    if (filters.endDate) {
+      qb.andWhere('COALESCE(r.date, r.created_at) <= :endDate', {
+        endDate: filters.endDate,
+      });
+    }
+
+    if (filters.search) {
+      const term = filters.search.trim();
+      const idNumber = Number(term);
+      const params: any = { term: `%${term}%` };
+      if (!Number.isNaN(idNumber)) {
+        params.idExact = idNumber;
+        qb.andWhere(
+          '(r.id = :idExact OR s.name LIKE :term OR r.note LIKE :term)',
+          params,
+        );
+      } else {
+        qb.andWhere('(s.name LIKE :term OR r.note LIKE :term)', params);
+      }
+    }
+
+    const rows = await qb.getRawMany<{
+      id: number;
+      date: Date | string | null;
+      supplierId: number | null;
+      supplierName: string | null;
+      total: string;
+      tax: string | null;
+      status: ReceiptStatus;
+      userId: number | null;
+      userName: string | null;
+      userUsername: string | null;
+      paid: string;
+      cashboxes: string | null;
+    }>();
+
+    return rows.map((row) => {
+      const total = Number(row.total || 0);
+      const paid = Number(row.paid || 0);
+      return {
+        id: Number(row.id),
+        date: row.date ? new Date(row.date).toISOString() : null,
+        supplierId:
+          row.supplierId != null ? Number(row.supplierId) : null,
+        supplierName: row.supplierName ?? null,
+        total: +total.toFixed(2),
+        tax: row.tax != null ? +Number(row.tax).toFixed(2) : null,
+        paid: +paid.toFixed(2),
+        outstanding: +(total - paid).toFixed(2),
+        status: row.status,
+        cashboxes: row.cashboxes
+          ? row.cashboxes.split(',').filter(Boolean)
+          : [],
+        user: row.userId
+          ? {
+              id: Number(row.userId),
+              name: row.userName,
+              username: row.userUsername,
+            }
+          : null,
+      };
     });
   }
 
@@ -287,8 +553,19 @@ export class RestocksService {
       .andWhere('r.id = :id', { id })
       .getRawOne<{ sum?: string }>();
     const paid = this.num2(Number(paidRow?.sum ?? 0));
-    const status: 'paid' | 'partial' | 'unpaid' =
-      paid >= total ? 'paid' : paid > 0 ? 'partial' : 'unpaid';
+    const manualState: ManualStatusState<ReceiptStatus> = {
+      enabled: !!r.statusManualEnabled,
+      value: r.statusManualValue,
+      note: r.statusManualNote ?? null,
+    };
+    const statusCode = computeReceiptStatus<ReceiptStatus>(
+      paid,
+      total,
+      manualState,
+      (n) => this.num2(n),
+      RECEIPT_STATUSES,
+    );
+    const status = statusCode.toLowerCase() as 'paid' | 'partial' | 'unpaid';
 
     return {
       id: r.id,
@@ -301,6 +578,11 @@ export class RestocksService {
       total,
       paid,
       status,
+      statusCode,
+      statusManualEnabled: r.statusManualEnabled,
+      statusManualValue: r.statusManualValue,
+      statusManualNote: r.statusManualNote,
+      statusManualSetAt: r.statusManualSetAt,
       user: r.user
         ? {
             id: r.user.id,

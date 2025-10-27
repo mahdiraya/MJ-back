@@ -4,11 +4,14 @@ import {
   PrimaryGeneratedColumn,
   Column,
   ManyToOne,
+  OneToMany,
   JoinColumn,
   CreateDateColumn,
 } from 'typeorm';
 import { Transaction } from './transaction.entity';
 import { Restock } from './restock.entity';
+import { Cashbox } from './cashbox.entity';
+import { CashboxEntry } from './cashbox-entry.entity';
 
 const dec2 = {
   to: (v: any) => v,
@@ -39,6 +42,16 @@ export class Payment {
   })
   @JoinColumn({ name: 'restock_id' }) // FK for restock payments
   restock: Restock | null;
+
+  @ManyToOne(() => Cashbox, (cashbox) => cashbox.payments, {
+    nullable: true,
+    onDelete: 'SET NULL',
+  })
+  @JoinColumn({ name: 'cashbox_id' })
+  cashbox: Cashbox | null;
+
+  @OneToMany(() => CashboxEntry, (entry) => entry.payment)
+  cashboxEntries: CashboxEntry[];
 
   @CreateDateColumn({ name: 'created_at' })
   created_at: Date;

@@ -10,6 +10,7 @@ import { BaseService } from '../base/base.service';
 import { CreateItemDto } from './create-item.dto';
 import { UpdateItemDto } from './update-item.dto';
 import { Roll } from '../entities/roll.entity';
+import { LowStockQueryDto } from './dto/low-stock.query.dto';
 
 @Injectable()
 export class ItemsService extends BaseService<Item> {
@@ -211,5 +212,42 @@ export class ItemsService extends BaseService<Item> {
   /** Alias to keep controller compatibility if it calls updateImageUrl(). */
   async updateImageUrl(id: number, url: string) {
     return this.setPhotoUrl(id, url);
+  }
+
+  async findLowStock(params: LowStockQueryDto) {
+    const eachThreshold = params.eachThreshold ?? 5;
+    const meterThreshold = params.meterThreshold ?? 10;
+
+    const rows = await this.itemsRepo
+      .createQueryBuilder('item')
+      .select('item.id', 'id')
+      .addSelect('item.name', 'name')
+      .addSelect('item.sku', 'sku')
+      .addSelect('item.category', 'category')
+      .addSelect('item.stockUnit', 'stockUnit')
+      .addSelect('COALESCE(item.stock, 0)', 'stock')
+      .where(
+        "(item.stockUnit = 'm' AND COALESCE(item.stock,0) <= :meterThreshold) OR ( (item.stockUnit IS NULL OR item.stockUnit <> 'm') AND COALESCE(item.stock,0) <= :eachThreshold)",
+        { meterThreshold, eachThreshold },
+      )
+      .orderBy('stock', 'ASC')
+      .addOrderBy('item.name', 'ASC')
+      .getRawMany<{
+        id: number;
+        name: string;
+        sku: string | null;
+        category: string | null;
+        stockUnit: 'm' | null;
+        stock: string;
+      }>();
+
+    return rows.map((row) => ({
+      id: Number(row.id),
+      name: row.name,
+      sku: row.sku,
+      category: row.category as any,
+      stockUnit: row.stockUnit as any,
+      stock: +Number(row.stock || 0).toFixed(row.stockUnit === 'm' ? 3 : 0),
+    }));
   }
 }

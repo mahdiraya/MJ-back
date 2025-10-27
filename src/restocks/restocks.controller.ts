@@ -6,17 +6,24 @@ import {
   Get,
   Param,
   ParseIntPipe,
+  Query,
 } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { RolesGuard } from '../auth/roles.guard';
 import { Roles } from '../auth/roles.decorator';
 import { RestocksService } from './restocks.service';
 import { CreateRestockDto } from './create-restock.dto';
+import { RestockMovementsQueryDto } from './dto/restock-movements.query.dto';
 
 @UseGuards(JwtAuthGuard, RolesGuard)
 @Controller('restocks')
 export class RestocksController {
   constructor(private readonly service: RestocksService) {}
+
+  @Get('movements')
+  listMovements(@Query() query: RestockMovementsQueryDto) {
+    return this.service.listMovements(query);
+  }
 
   @Roles('manager', 'admin')
   @Post()

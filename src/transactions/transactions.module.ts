@@ -9,6 +9,8 @@ import { TransactionItem } from '../entities/transaction-item.entity';
 import { Item } from '../entities/item.entity';
 import { Roll } from '../entities/roll.entity';
 import { Payment } from '../entities/payment.entity';
+import { Cashbox } from '../entities/cashbox.entity';
+import { CashboxEntry } from '../entities/cashbox-entry.entity';
 
 @Module({
   imports: [
@@ -18,6 +20,8 @@ import { Payment } from '../entities/payment.entity';
       Item,
       Roll,
       Payment, // <-- add this
+      Cashbox,
+      CashboxEntry,
     ]),
   ],
   controllers: [TransactionsController],

@@ -45,6 +45,27 @@ export class Transaction {
   })
   status!: ReceiptStatus;
 
+  @Column({
+    name: 'status_manual_enabled',
+    type: 'boolean',
+    default: false,
+  })
+  statusManualEnabled: boolean;
+
+  @Column({
+    name: 'status_manual_value',
+    type: 'enum',
+    enum: ['PAID', 'PARTIAL', 'UNPAID'],
+    nullable: true,
+  })
+  statusManualValue: ReceiptStatus | null;
+
+  @Column({ name: 'status_manual_note', type: 'text', nullable: true })
+  statusManualNote: string | null;
+
+  @Column({ name: 'status_manual_set_at', type: 'datetime', nullable: true })
+  statusManualSetAt: Date | null;
+
   @OneToMany(
     () => TransactionItem,
     (transactionItem) => transactionItem.transaction,
