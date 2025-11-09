@@ -11,6 +11,7 @@ import { Roll } from '../entities/roll.entity';
 import { Payment } from '../entities/payment.entity';
 import { Cashbox } from '../entities/cashbox.entity';
 import { CashboxEntry } from '../entities/cashbox-entry.entity';
+import { Customer } from '../entities/customer.entity';
 
 @Module({
   imports: [
@@ -22,6 +23,7 @@ import { CashboxEntry } from '../entities/cashbox-entry.entity';
       Payment, // <-- add this
       Cashbox,
       CashboxEntry,
+      Customer,
     ]),
   ],
   controllers: [TransactionsController],

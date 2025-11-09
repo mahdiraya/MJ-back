@@ -44,7 +44,22 @@ export type StatsOverview = {
     last7Days: number;
     daily: Array<{ date: string; total: number }>;
   };
-  netCashDaily: Array<{ date: string; total: number }>;
+  profitSeries: {
+    weekly: Array<{ date: string; total: number }>;
+    monthly: Array<{ date: string; total: number }>;
+    yearly: Array<{ period: string; total: number }>;
+  };
+  cashReceivedSeries: {
+    weekly: Array<{ date: string; total: number }>;
+    monthly: Array<{ date: string; total: number }>;
+    yearly: Array<{ period: string; total: number }>;
+  };
+  monthly: {
+    sales: number;
+    collected: number;
+    purchases: number;
+    net: number;
+  };
 };
 
 @Injectable()
@@ -56,16 +71,38 @@ export class StatsService {
     private readonly restockRepo: Repository<Restock>,
     @InjectRepository(Transaction)
     private readonly transactionRepo: Repository<Transaction>,
+    @InjectRepository(Payment)
+    private readonly paymentRepo: Repository<Payment>,
   ) {}
 
   async getOverview(): Promise<StatsOverview> {
-    const [cashboxes, supplierDebt, salesDaily, restocksDaily] =
-      await Promise.all([
-        this.loadCashboxSummaries(),
-        this.loadSupplierDebtSummary(),
-        this.loadSalesDaily(),
-        this.loadRestocksDaily(),
-      ]);
+    const [
+      cashboxes,
+      supplierDebt,
+      salesDaily,
+      restocksDaily,
+      monthlySummary,
+      salesCurrentMonth,
+      restocksCurrentMonth,
+      salesYearly,
+      restocksYearly,
+      cashWeekly,
+      cashMonthly,
+      cashYearly,
+    ] = await Promise.all([
+      this.loadCashboxSummaries(),
+      this.loadSupplierDebtSummary(),
+      this.loadSalesDaily(),
+      this.loadRestocksDaily(),
+      this.computeMonthlySnapshot(),
+      this.loadSalesCurrentMonthDaily(),
+      this.loadRestocksCurrentMonthDaily(),
+      this.loadSalesYearly(),
+      this.loadRestocksYearly(),
+      this.loadCashReceivedLast7Days(),
+      this.loadCashReceivedCurrentMonthDaily(),
+      this.loadCashReceivedYearly(),
+    ]);
 
     const cashboxTotals = cashboxes.reduce(
       (acc, cb) => {
@@ -85,14 +122,29 @@ export class StatsService {
     const salesLast7 = salesDaily.reduce((sum, d) => sum + d.total, 0);
     const restocksLast7 = restocksDaily.reduce((sum, d) => sum + d.total, 0);
 
-    const restockMap = new Map(restocksDaily.map((d) => [d.date, d.total]));
-    const netCashDaily = salesDaily.map((day) => {
-      const restockTotal = restockMap.get(day.date) ?? 0;
-      return {
-        date: day.date,
-        total: +(day.total - restockTotal).toFixed(2),
-      };
-    });
+    const restockWeeklyMap = new Map(
+      restocksDaily.map((d) => [d.date, d.total]),
+    );
+    const profitWeekly = salesDaily.map((day) => ({
+      date: day.date,
+      total: +(day.total - (restockWeeklyMap.get(day.date) ?? 0)).toFixed(2),
+    }));
+
+    const restockMonthlyMap = new Map(
+      restocksCurrentMonth.map((d) => [d.date, d.total]),
+    );
+    const profitMonthlyDaily = salesCurrentMonth.map((day) => ({
+      date: day.date,
+      total: +(day.total - (restockMonthlyMap.get(day.date) ?? 0)).toFixed(2),
+    }));
+
+    const restockYearlyMap = new Map(
+      restocksYearly.map((m) => [m.period, m.total]),
+    );
+    const profitYearly = salesYearly.map((m) => ({
+      period: m.period,
+      total: +(m.total - (restockYearlyMap.get(m.period) ?? 0)).toFixed(2),
+    }));
 
     return {
       generatedAt: new Date().toISOString(),
@@ -113,8 +165,137 @@ export class StatsService {
         last7Days: +restocksLast7.toFixed(2),
         daily: restocksDaily,
       },
-      netCashDaily,
+      profitSeries: {
+        weekly: profitWeekly,
+        monthly: profitMonthlyDaily,
+        yearly: profitYearly,
+      },
+      cashReceivedSeries: {
+        weekly: cashWeekly,
+        monthly: cashMonthly,
+        yearly: cashYearly,
+      },
+      monthly: monthlySummary,
     };
+  }
+
+  private async computeMonthlySnapshot(): Promise<{
+    sales: number;
+    collected: number;
+    purchases: number;
+    net: number;
+  }> {
+    const now = new Date();
+    const startOfMonth = new Date(
+      now.getFullYear(),
+      now.getMonth(),
+      1,
+      0,
+      0,
+      0,
+      0,
+    );
+
+    const salesRow = await this.transactionRepo
+      .createQueryBuilder('t')
+      .select('COALESCE(SUM(t.total), 0)', 'total')
+      .where('t.date >= :start', { start: startOfMonth })
+      .getRawOne<{ total?: string }>();
+
+    const restockRow = await this.restockRepo
+      .createQueryBuilder('r')
+      .select('COALESCE(SUM(r.total), 0)', 'total')
+      .where('COALESCE(r.date, r.created_at) >= :start', {
+        start: startOfMonth,
+      })
+      .getRawOne<{ total?: string }>();
+
+    const collectedRow = await this.paymentRepo
+      .createQueryBuilder('p')
+      .select('COALESCE(SUM(p.amount), 0)', 'total')
+      .where('p.kind = :kind', { kind: 'sale' })
+      .andWhere('p.created_at >= :start', { start: startOfMonth })
+      .getRawOne<{ total?: string }>();
+
+    const monthSales = Number(salesRow?.total ?? 0);
+    const monthPurchases = Number(restockRow?.total ?? 0);
+    const monthCollected = Number(collectedRow?.total ?? 0);
+    const net = monthSales - monthPurchases;
+
+    return {
+      sales: +monthSales.toFixed(2),
+      collected: +monthCollected.toFixed(2),
+      purchases: +monthPurchases.toFixed(2),
+      net: +net.toFixed(2),
+    };
+  }
+
+  private async loadCashReceivedLast7Days() {
+    const range = this.buildLast7DaysRange();
+    const rows = await this.paymentRepo
+      .createQueryBuilder('p')
+      .select('DATE(p.created_at)', 'day')
+      .addSelect('SUM(p.amount)', 'total')
+      .where('p.kind = :kind', { kind: 'sale' })
+      .andWhere('p.created_at >= :from', { from: range.start })
+      .groupBy('day')
+      .orderBy('day', 'ASC')
+      .getRawMany<{ day: string; total: string }>();
+
+    const map = new Map<string, number>();
+    for (const row of rows) {
+      map.set(this.formatDate(row.day), Number(row.total || 0));
+    }
+
+    return range.days.map((day) => ({
+      date: day,
+      total: +(map.get(day) ?? 0).toFixed(2),
+    }));
+  }
+
+  private async loadCashReceivedCurrentMonthDaily() {
+    const range = this.buildCurrentMonthRange();
+    const rows = await this.paymentRepo
+      .createQueryBuilder('p')
+      .select('DATE(p.created_at)', 'day')
+      .addSelect('SUM(p.amount)', 'total')
+      .where('p.kind = :kind', { kind: 'sale' })
+      .andWhere('p.created_at >= :start', { start: range.start })
+      .groupBy('day')
+      .orderBy('day', 'ASC')
+      .getRawMany<{ day: string; total: string }>();
+
+    const map = new Map<string, number>();
+    for (const row of rows) {
+      map.set(this.formatDate(row.day), Number(row.total || 0));
+    }
+
+    return range.days.map((day) => ({
+      date: day,
+      total: +(map.get(day) ?? 0).toFixed(2),
+    }));
+  }
+
+  private async loadCashReceivedYearly() {
+    const months = this.buildLastMonthsRange(12);
+    const rows = await this.paymentRepo
+      .createQueryBuilder('p')
+      .select("DATE_FORMAT(p.created_at, '%Y-%m')", 'period')
+      .addSelect('SUM(p.amount)', 'total')
+      .where('p.kind = :kind', { kind: 'sale' })
+      .andWhere('p.created_at >= :start', { start: months[0].start })
+      .groupBy('period')
+      .getRawMany<{ period: string; total: string }>();
+
+    const map = new Map<string, number>();
+    for (const row of rows) {
+      map.set(row.period, Number(row.total || 0));
+    }
+
+    return months.map((month) => ({
+      period: month.label,
+      total: +(map.get(month.label) ?? 0).toFixed(2),
+    }));
   }
 
   private async loadCashboxSummaries() {
@@ -269,6 +450,96 @@ export class StatsService {
     }));
   }
 
+  private async loadSalesCurrentMonthDaily() {
+    const range = this.buildCurrentMonthRange();
+    const rows = await this.transactionRepo
+      .createQueryBuilder('t')
+      .select(`DATE(t.date)`, 'day')
+      .addSelect('SUM(t.total)', 'total')
+      .where('t.date >= :start', { start: range.start })
+      .groupBy('day')
+      .orderBy('day', 'ASC')
+      .getRawMany<{ day: string; total: string }>();
+
+    const map = new Map<string, number>();
+    for (const row of rows) {
+      map.set(this.formatDate(row.day), Number(row.total || 0));
+    }
+
+    return range.days.map((day) => ({
+      date: day,
+      total: +(map.get(day) ?? 0).toFixed(2),
+    }));
+  }
+
+  private async loadRestocksCurrentMonthDaily() {
+    const range = this.buildCurrentMonthRange();
+    const rows = await this.restockRepo
+      .createQueryBuilder('r')
+      .select(`DATE(COALESCE(r.date, r.created_at))`, 'day')
+      .addSelect('SUM(r.total)', 'total')
+      .where('COALESCE(r.date, r.created_at) >= :start', {
+        start: range.start,
+      })
+      .groupBy('day')
+      .orderBy('day', 'ASC')
+      .getRawMany<{ day: string; total: string }>();
+
+    const map = new Map<string, number>();
+    for (const row of rows) {
+      map.set(this.formatDate(row.day), Number(row.total || 0));
+    }
+
+    return range.days.map((day) => ({
+      date: day,
+      total: +(map.get(day) ?? 0).toFixed(2),
+    }));
+  }
+
+  private async loadSalesYearly() {
+    const months = this.buildLastMonthsRange(12);
+    const rows = await this.transactionRepo
+      .createQueryBuilder('t')
+      .select("DATE_FORMAT(t.date, '%Y-%m')", 'period')
+      .addSelect('SUM(t.total)', 'total')
+      .where('t.date >= :start', { start: months[0].start })
+      .groupBy('period')
+      .getRawMany<{ period: string; total: string }>();
+
+    const map = new Map<string, number>();
+    for (const row of rows) {
+      map.set(row.period, Number(row.total || 0));
+    }
+
+    return months.map((month) => ({
+      period: month.label,
+      total: +(map.get(month.label) ?? 0).toFixed(2),
+    }));
+  }
+
+  private async loadRestocksYearly() {
+    const months = this.buildLastMonthsRange(12);
+    const rows = await this.restockRepo
+      .createQueryBuilder('r')
+      .select("DATE_FORMAT(COALESCE(r.date, r.created_at), '%Y-%m')", 'period')
+      .addSelect('SUM(r.total)', 'total')
+      .where('COALESCE(r.date, r.created_at) >= :start', {
+        start: months[0].start,
+      })
+      .groupBy('period')
+      .getRawMany<{ period: string; total: string }>();
+
+    const map = new Map<string, number>();
+    for (const row of rows) {
+      map.set(row.period, Number(row.total || 0));
+    }
+
+    return months.map((month) => ({
+      period: month.label,
+      total: +(map.get(month.label) ?? 0).toFixed(2),
+    }));
+  }
+
   private buildLast7DaysRange() {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
@@ -284,6 +555,37 @@ export class StatsService {
     }
 
     return { start, days };
+  }
+
+  private buildCurrentMonthRange() {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const start = new Date(today.getFullYear(), today.getMonth(), 1);
+    const days: string[] = [];
+    const cursor = new Date(start);
+    while (cursor <= today) {
+      days.push(this.formatDate(cursor));
+      cursor.setDate(cursor.getDate() + 1);
+    }
+    return { start, end: today, days };
+  }
+
+  private buildLastMonthsRange(count: number) {
+    const now = new Date();
+    now.setDate(1);
+    now.setHours(0, 0, 0, 0);
+
+    const months: Array<{ start: Date; end: Date; label: string }> = [];
+    for (let i = count - 1; i >= 0; i--) {
+      const start = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      const end = new Date(now.getFullYear(), now.getMonth() - i + 1, 1);
+      const label = `${start.getFullYear()}-${`${start.getMonth() + 1}`.padStart(
+        2,
+        '0',
+      )}`;
+      months.push({ start, end, label });
+    }
+    return months;
   }
 
   private formatDate(input: string | Date): string {

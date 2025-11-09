@@ -17,6 +17,7 @@ import { BaseService } from '../base/base.service';
 import { Transaction, ReceiptStatus } from '../entities/transaction.entity';
 import { Item } from '../entities/item.entity';
 import { TransactionItem } from '../entities/transaction-item.entity';
+import { Customer } from '../entities/customer.entity';
 import { CreateTransactionDto } from './create-transaction.dto';
 import { REQUEST } from '@nestjs/core';
 import { Request } from 'express';
@@ -120,6 +121,10 @@ export class TransactionsService extends BaseService<Transaction> {
       }
 
       const userId = this.resolveUserId(data);
+      const customerEntity = await this.resolveCustomer(
+        manager.getRepository(Customer),
+        data,
+      );
 
       // Normalize lines
       const lines: AnyLine[] = data.items.map((i: any) => {
@@ -286,8 +291,8 @@ export class TransactionsService extends BaseService<Transaction> {
       const txRepo = manager.getRepository(Transaction);
       const txEntity = txRepo.create({
         user: { id: userId } as any,
-        customer: (data as any).customer
-          ? ({ id: (data as any).customer } as any)
+        customer: customerEntity
+          ? ({ id: customerEntity.id } as any)
           : undefined,
         total: totalRounded,
         receipt_type: (data as any).receipt_type || 'simple',
@@ -647,5 +652,38 @@ export class TransactionsService extends BaseService<Transaction> {
       .addOrderBy('t.id', 'DESC')
       .limit(Math.max(1, Math.min(1000, limit)))
       .getMany();
+  }
+
+  private async resolveCustomer(
+    repo: Repository<Customer>,
+    data: Partial<CreateTransactionDto>,
+  ): Promise<Customer | null> {
+    const idCandidate = (data as any)?.customer;
+    if (idCandidate != null) {
+      const id = Number(idCandidate);
+      if (!Number.isFinite(id) || id <= 0) {
+        throw new BadRequestException('Invalid customer id.');
+      }
+      const existing = await repo.findOne({ where: { id } });
+      if (!existing) {
+        throw new BadRequestException('Customer not found.');
+      }
+      return existing;
+    }
+
+    const nameRaw = ((data as any)?.customerName ?? '').toString().trim();
+    if (!nameRaw) return null;
+
+    const byName = await repo
+      .createQueryBuilder('customer')
+      .where('LOWER(customer.name) = :name', { name: nameRaw.toLowerCase() })
+      .getOne();
+    if (byName) return byName;
+
+    const created = repo.create({
+      name: nameRaw,
+      customer_type: 'regular',
+    } as DeepPartial<Customer>);
+    return repo.save(created);
   }
 }
