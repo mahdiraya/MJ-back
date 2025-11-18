@@ -4,10 +4,11 @@ import { ItemsController } from './items.controller';
 import { ItemsService } from './items.service';
 import { Item } from '../entities/item.entity';
 import { Roll } from '../entities/roll.entity';
+import { InventoryUnit } from '../entities/inventory-unit.entity';
 
 @Module({
   imports: [
-    TypeOrmModule.forFeature([Item, Roll]), // <-- include Roll here
+    TypeOrmModule.forFeature([Item, Roll, InventoryUnit]),
   ],
   controllers: [ItemsController],
   providers: [ItemsService],

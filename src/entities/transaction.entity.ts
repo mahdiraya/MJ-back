@@ -35,6 +35,9 @@ export class Transaction {
   @Column('decimal', { precision: 10, scale: 2 })
   total: number;
 
+  @Column({ type: 'text', nullable: true })
+  note: string | null;
+
   @Column({ type: 'enum', enum: ['simple', 'detailed'] })
   receipt_type: 'simple' | 'detailed';
 
@@ -74,4 +77,14 @@ export class Transaction {
 
   @OneToMany(() => Payment, (p) => p.transaction)
   payments: Payment[];
+
+  @ManyToOne(() => User, { nullable: true })
+  @JoinColumn({ name: 'last_edit_user_id' })
+  lastEditUser?: User | null;
+
+  @Column({ name: 'last_edit_note', type: 'text', nullable: true })
+  lastEditNote?: string | null;
+
+  @Column({ name: 'last_edit_at', type: 'datetime', nullable: true })
+  lastEditAt?: Date | null;
 }

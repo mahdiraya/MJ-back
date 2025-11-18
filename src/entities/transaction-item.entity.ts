@@ -4,10 +4,12 @@ import {
   Column,
   ManyToOne,
   JoinColumn,
+  OneToMany,
 } from 'typeorm';
 import { Transaction } from './transaction.entity';
 import { Item } from './item.entity';
 import { Roll } from './roll.entity';
+import { TransactionItemUnit } from './transaction-item-unit.entity';
 
 const decimalTransformer = {
   to: (v: number | null) => v,
@@ -57,4 +59,18 @@ export class TransactionItem {
     transformer: decimalTransformer,
   })
   price_each: number;
+
+  @Column('decimal', {
+    precision: 10,
+    scale: 2,
+    transformer: decimalTransformer,
+    nullable: true,
+  })
+  cost_each: number | null;
+
+  @OneToMany(
+    () => TransactionItemUnit,
+    (transactionItemUnit) => transactionItemUnit.transactionItem,
+  )
+  inventoryUnitLinks!: TransactionItemUnit[];
 }

@@ -8,6 +8,7 @@ import { CashboxEntry } from '../entities/cashbox-entry.entity';
 import { Restock } from '../entities/restock.entity';
 import { Transaction } from '../entities/transaction.entity';
 import { Payment } from '../entities/payment.entity';
+import { TransactionItem } from '../entities/transaction-item.entity';
 
 @Module({
   imports: [
@@ -16,6 +17,7 @@ import { Payment } from '../entities/payment.entity';
       CashboxEntry,
       Restock,
       Transaction,
+      TransactionItem,
       Payment,
     ]),
   ],

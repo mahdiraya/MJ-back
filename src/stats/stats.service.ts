@@ -1,12 +1,18 @@
 import { Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { Repository, SelectQueryBuilder } from 'typeorm';
 
 import { Cashbox } from '../entities/cashbox.entity';
 import { CashboxEntry } from '../entities/cashbox-entry.entity';
 import { Restock } from '../entities/restock.entity';
 import { Payment } from '../entities/payment.entity';
 import { Transaction } from '../entities/transaction.entity';
+import { TransactionItem } from '../entities/transaction-item.entity';
+import { TransactionItemUnit } from '../entities/transaction-item-unit.entity';
+import {
+  InventoryReturn,
+  ReturnStatus,
+} from '../entities/inventory-return.entity';
 
 export type StatsOverview = {
   generatedAt: string;
@@ -54,6 +60,16 @@ export type StatsOverview = {
     monthly: Array<{ date: string; total: number }>;
     yearly: Array<{ period: string; total: number }>;
   };
+  cashFlowSeries: {
+    weekly: Array<{ date: string; in: number; out: number }>;
+    monthly: Array<{ date: string; in: number; out: number }>;
+    yearly: Array<{ period: string; in: number; out: number }>;
+  };
+  bookedFlowSeries: {
+    weekly: Array<{ date: string; in: number; out: number }>;
+    monthly: Array<{ date: string; in: number; out: number }>;
+    yearly: Array<{ period: string; in: number; out: number }>;
+  };
   monthly: {
     sales: number;
     collected: number;
@@ -73,7 +89,16 @@ export class StatsService {
     private readonly transactionRepo: Repository<Transaction>,
     @InjectRepository(Payment)
     private readonly paymentRepo: Repository<Payment>,
+    @InjectRepository(TransactionItem)
+    private readonly transactionItemRepo: Repository<TransactionItem>,
   ) {}
+
+  private readonly returnStatuses: ReturnStatus[] = [
+    'pending',
+    'restocked',
+    'trashed',
+    'returned_to_supplier',
+  ];
 
   async getOverview(): Promise<StatsOverview> {
     const [
@@ -89,6 +114,10 @@ export class StatsService {
       cashWeekly,
       cashMonthly,
       cashYearly,
+      profitWeeklyRealized,
+      profitMonthlyRealized,
+      profitYearlyRealized,
+      cashFlowSeries,
     ] = await Promise.all([
       this.loadCashboxSummaries(),
       this.loadSupplierDebtSummary(),
@@ -102,6 +131,10 @@ export class StatsService {
       this.loadCashReceivedLast7Days(),
       this.loadCashReceivedCurrentMonthDaily(),
       this.loadCashReceivedYearly(),
+      this.loadProfitWeekly(),
+      this.loadProfitCurrentMonth(),
+      this.loadProfitYearly(),
+      this.loadCashFlowSeries(),
     ]);
 
     const cashboxTotals = cashboxes.reduce(
@@ -122,29 +155,14 @@ export class StatsService {
     const salesLast7 = salesDaily.reduce((sum, d) => sum + d.total, 0);
     const restocksLast7 = restocksDaily.reduce((sum, d) => sum + d.total, 0);
 
-    const restockWeeklyMap = new Map(
-      restocksDaily.map((d) => [d.date, d.total]),
-    );
-    const profitWeekly = salesDaily.map((day) => ({
-      date: day.date,
-      total: +(day.total - (restockWeeklyMap.get(day.date) ?? 0)).toFixed(2),
-    }));
-
-    const restockMonthlyMap = new Map(
-      restocksCurrentMonth.map((d) => [d.date, d.total]),
-    );
-    const profitMonthlyDaily = salesCurrentMonth.map((day) => ({
-      date: day.date,
-      total: +(day.total - (restockMonthlyMap.get(day.date) ?? 0)).toFixed(2),
-    }));
-
-    const restockYearlyMap = new Map(
-      restocksYearly.map((m) => [m.period, m.total]),
-    );
-    const profitYearly = salesYearly.map((m) => ({
-      period: m.period,
-      total: +(m.total - (restockYearlyMap.get(m.period) ?? 0)).toFixed(2),
-    }));
+    const bookedFlowSeries = this.buildBookedFlowSeries({
+      weeklySales: salesDaily,
+      weeklyRestocks: restocksDaily,
+      monthlySales: salesCurrentMonth,
+      monthlyRestocks: restocksCurrentMonth,
+      yearlySales: salesYearly,
+      yearlyRestocks: restocksYearly,
+    });
 
     return {
       generatedAt: new Date().toISOString(),
@@ -166,15 +184,17 @@ export class StatsService {
         daily: restocksDaily,
       },
       profitSeries: {
-        weekly: profitWeekly,
-        monthly: profitMonthlyDaily,
-        yearly: profitYearly,
+        weekly: profitWeeklyRealized,
+        monthly: profitMonthlyRealized,
+        yearly: profitYearlyRealized,
       },
       cashReceivedSeries: {
         weekly: cashWeekly,
         monthly: cashMonthly,
         yearly: cashYearly,
       },
+      cashFlowSeries,
+      bookedFlowSeries,
       monthly: monthlySummary,
     };
   }
@@ -196,10 +216,17 @@ export class StatsService {
       0,
     );
 
-    const salesRow = await this.transactionRepo
+    const salesQb = this.transactionRepo
       .createQueryBuilder('t')
-      .select('COALESCE(SUM(t.total), 0)', 'total')
-      .where('t.date >= :start', { start: startOfMonth })
+      .where('t.date >= :start', { start: startOfMonth });
+    this.applyReturnTotalsJoin(salesQb, 'returnStats');
+    const salesRow = await salesQb
+      .select(
+        `COALESCE(SUM(${this.getNetTransactionTotalExpression(
+          'returnStats',
+        )}), 0)`,
+        'total',
+      )
       .getRawOne<{ total?: string }>();
 
     const restockRow = await this.restockRepo
@@ -295,6 +322,373 @@ export class StatsService {
     return months.map((month) => ({
       period: month.label,
       total: +(map.get(month.label) ?? 0).toFixed(2),
+    }));
+  }
+
+  private async loadCashFlowSeries() {
+    const [weekly, monthly, yearly] = await Promise.all([
+      this.loadCashFlowWeekly(),
+      this.loadCashFlowMonthly(),
+      this.loadCashFlowYearly(),
+    ]);
+    return { weekly, monthly, yearly };
+  }
+
+  private async loadCashFlowWeekly() {
+    const range = this.buildLast7DaysRange();
+    const rows = await this.paymentRepo
+      .createQueryBuilder('p')
+      .select('DATE(p.created_at)', 'bucket')
+      .addSelect(
+        "SUM(CASE WHEN p.kind = 'sale' THEN p.amount ELSE 0 END)",
+        'cashIn',
+      )
+      .addSelect(
+        "SUM(CASE WHEN p.kind = 'restock' THEN p.amount ELSE 0 END)",
+        'cashOut',
+      )
+      .where('p.created_at >= :start', { start: range.start })
+      .groupBy('bucket')
+      .orderBy('bucket', 'ASC')
+      .getRawMany<{ bucket: string; cashIn: string; cashOut: string }>();
+
+    const map = new Map<string, { in: number; out: number }>();
+    for (const row of rows) {
+      map.set(this.formatDate(row.bucket), {
+        in: Number(row.cashIn || 0),
+        out: Number(row.cashOut || 0),
+      });
+    }
+
+    return range.days.map((day) => {
+      const entry = map.get(day) || { in: 0, out: 0 };
+      return {
+        date: day,
+        in: +entry.in.toFixed(2),
+        out: +entry.out.toFixed(2),
+      };
+    });
+  }
+
+  private async loadCashFlowMonthly() {
+    const range = this.buildCurrentMonthRange();
+    const rows = await this.paymentRepo
+      .createQueryBuilder('p')
+      .select('DATE(p.created_at)', 'bucket')
+      .addSelect(
+        "SUM(CASE WHEN p.kind = 'sale' THEN p.amount ELSE 0 END)",
+        'cashIn',
+      )
+      .addSelect(
+        "SUM(CASE WHEN p.kind = 'restock' THEN p.amount ELSE 0 END)",
+        'cashOut',
+      )
+      .where('p.created_at >= :start', { start: range.start })
+      .groupBy('bucket')
+      .orderBy('bucket', 'ASC')
+      .getRawMany<{ bucket: string; cashIn: string; cashOut: string }>();
+
+    const map = new Map<string, { in: number; out: number }>();
+    for (const row of rows) {
+      map.set(this.formatDate(row.bucket), {
+        in: Number(row.cashIn || 0),
+        out: Number(row.cashOut || 0),
+      });
+    }
+
+    return range.days.map((day) => {
+      const entry = map.get(day) || { in: 0, out: 0 };
+      return {
+        date: day,
+        in: +entry.in.toFixed(2),
+        out: +entry.out.toFixed(2),
+      };
+    });
+  }
+
+  private async loadCashFlowYearly() {
+    const months = this.buildLastMonthsRange(12);
+    const rows = await this.paymentRepo
+      .createQueryBuilder('p')
+      .select("DATE_FORMAT(p.created_at, '%Y-%m')", 'bucket')
+      .addSelect(
+        "SUM(CASE WHEN p.kind = 'sale' THEN p.amount ELSE 0 END)",
+        'cashIn',
+      )
+      .addSelect(
+        "SUM(CASE WHEN p.kind = 'restock' THEN p.amount ELSE 0 END)",
+        'cashOut',
+      )
+      .where('p.created_at >= :start', { start: months[0].start })
+      .groupBy('bucket')
+      .orderBy('bucket', 'ASC')
+      .getRawMany<{ bucket: string; cashIn: string; cashOut: string }>();
+
+    const map = new Map<string, { in: number; out: number }>();
+    for (const row of rows) {
+      map.set(row.bucket, {
+        in: Number(row.cashIn || 0),
+        out: Number(row.cashOut || 0),
+      });
+    }
+
+    return months.map((month) => {
+      const entry = map.get(month.label) || { in: 0, out: 0 };
+      return {
+        period: month.label,
+        in: +entry.in.toFixed(2),
+        out: +entry.out.toFixed(2),
+      };
+    });
+  }
+
+  private buildBookedFlowSeries({
+    weeklySales,
+    weeklyRestocks,
+    monthlySales,
+    monthlyRestocks,
+    yearlySales,
+    yearlyRestocks,
+  }: {
+    weeklySales: Array<{ date: string; total: number }>;
+    weeklyRestocks: Array<{ date: string; total: number }>;
+    monthlySales: Array<{ date: string; total: number }>;
+    monthlyRestocks: Array<{ date: string; total: number }>;
+    yearlySales: Array<{ period: string; total: number }>;
+    yearlyRestocks: Array<{ period: string; total: number }>;
+  }) {
+    const weeklyRange = this.buildLast7DaysRange();
+    const weeklySalesMap = new Map(
+      weeklySales.map((entry) => [entry.date, entry.total]),
+    );
+    const weeklyRestockMap = new Map(
+      weeklyRestocks.map((entry) => [entry.date, entry.total]),
+    );
+    const weekly = weeklyRange.days.map((day) => ({
+      date: day,
+      in: +Number(weeklySalesMap.get(day) ?? 0).toFixed(2),
+      out: +Number(weeklyRestockMap.get(day) ?? 0).toFixed(2),
+    }));
+
+    const monthRange = this.buildCurrentMonthRange();
+    const monthlySalesMap = new Map(
+      monthlySales.map((entry) => [entry.date, entry.total]),
+    );
+    const monthlyRestockMap = new Map(
+      monthlyRestocks.map((entry) => [entry.date, entry.total]),
+    );
+    const monthly = monthRange.days.map((day) => ({
+      date: day,
+      in: +Number(monthlySalesMap.get(day) ?? 0).toFixed(2),
+      out: +Number(monthlyRestockMap.get(day) ?? 0).toFixed(2),
+    }));
+
+    const months = this.buildLastMonthsRange(12);
+    const yearlySalesMap = new Map(
+      yearlySales.map((entry) => [entry.period, entry.total]),
+    );
+    const yearlyRestockMap = new Map(
+      yearlyRestocks.map((entry) => [entry.period, entry.total]),
+    );
+    const yearly = months.map((month) => ({
+      period: month.label,
+      in: +Number(yearlySalesMap.get(month.label) ?? 0).toFixed(2),
+      out: +Number(yearlyRestockMap.get(month.label) ?? 0).toFixed(2),
+    }));
+
+    return { weekly, monthly, yearly };
+  }
+
+  private applyReturnTotalsJoin(
+    qb: SelectQueryBuilder<Transaction>,
+    alias = 'returnStats',
+  ) {
+    return qb.leftJoin(
+      (sub) =>
+        sub
+          .select('ti.transaction_id', 'transaction_id')
+          .addSelect('SUM(COALESCE(ti.price_each, 0))', 'return_total')
+          .from(TransactionItem, 'ti')
+          .innerJoin('ti.inventoryUnitLinks', 'link')
+          .innerJoin(
+            InventoryReturn,
+            'ret',
+            'ret.inventory_unit_id = link.inventory_unit_id AND ret.status IN (:...returnStates)',
+            {
+              returnStates: this.returnStatuses,
+            },
+          )
+          .groupBy('ti.transaction_id'),
+      alias,
+      `${alias}.transaction_id = t.id`,
+    );
+  }
+
+  private getNetTransactionTotalExpression(alias = 'returnStats') {
+    return `COALESCE(t.total, 0) - COALESCE(${alias}.return_total, 0)`;
+  }
+
+  private applyReturnUnitJoin(
+    qb: SelectQueryBuilder<TransactionItem>,
+    alias = 'returnedUnits',
+  ) {
+    return qb.leftJoin(
+      (sub) =>
+        sub
+          .select('link.transaction_item_id', 'transaction_item_id')
+          .addSelect('COUNT(ret.id)', 'total_count')
+          .addSelect(
+            `SUM(CASE WHEN ret.status = 'restocked' THEN 1 ELSE 0 END)`,
+            'restocked_count',
+          )
+          .from(TransactionItemUnit, 'link')
+          .innerJoin(
+            InventoryReturn,
+            'ret',
+            'ret.inventory_unit_id = link.inventory_unit_id AND ret.status IN (:...returnStates)',
+            { returnStates: this.returnStatuses },
+          )
+          .groupBy('link.transaction_item_id'),
+      alias,
+      `${alias}.transaction_item_id = ti.id`,
+    );
+  }
+
+  private getRevenueExpression(alias = 'ti', returnedExpr?: string) {
+    const returned =
+      returnedExpr != null ? `COALESCE(${returnedExpr}, 0)` : '0';
+    return `CASE WHEN ${alias}.mode = 'METER'
+      THEN ${alias}.price_each * COALESCE(${alias}.length_m, 0)
+      ELSE ${alias}.price_each * GREATEST(${alias}.quantity - ${returned}, 0) END`;
+  }
+
+  private getCostExpression(alias = 'ti', returnedExpr?: string) {
+    const returned =
+      returnedExpr != null ? `COALESCE(${returnedExpr}, 0)` : '0';
+    return `CASE WHEN ${alias}.mode = 'METER'
+      THEN COALESCE(${alias}.cost_each, 0) * COALESCE(${alias}.length_m, 0)
+      ELSE COALESCE(${alias}.cost_each, 0) * GREATEST(${alias}.quantity - ${returned}, 0) END`;
+  }
+
+  private async loadProfitWeekly() {
+    const range = this.buildLast7DaysRange();
+    const qb = this.transactionItemRepo
+      .createQueryBuilder('ti')
+      .innerJoin('ti.transaction', 't')
+      .where('t.date >= :start', { start: range.start });
+    this.applyReturnUnitJoin(qb, 'returnedUnits');
+    const rows = await qb
+      .select('DATE(t.date)', 'day')
+      .addSelect(
+        `SUM(${this.getRevenueExpression(
+          'ti',
+          'returnedUnits.total_count',
+        )})`,
+        'revenue',
+      )
+      .addSelect(
+        `SUM(${this.getCostExpression(
+          'ti',
+          'returnedUnits.restocked_count',
+        )})`,
+        'cost',
+      )
+      .groupBy('day')
+      .orderBy('day', 'ASC')
+      .getRawMany<{ day: string; revenue: string; cost: string }>();
+
+    const map = new Map<string, number>();
+    for (const row of rows) {
+      const key = this.formatDate(row.day);
+      const revenue = Number(row.revenue || 0);
+      const cost = Number(row.cost || 0);
+      map.set(key, revenue - cost);
+    }
+
+    return range.days.map((day) => ({
+      date: day,
+      total: +((map.get(day) ?? 0).toFixed(2)),
+    }));
+  }
+
+  private async loadProfitCurrentMonth() {
+    const range = this.buildCurrentMonthRange();
+    const qb = this.transactionItemRepo
+      .createQueryBuilder('ti')
+      .innerJoin('ti.transaction', 't')
+      .where('t.date >= :start', { start: range.start });
+    this.applyReturnUnitJoin(qb, 'returnedUnits');
+    const rows = await qb
+      .select('DATE(t.date)', 'day')
+      .addSelect(
+        `SUM(${this.getRevenueExpression(
+          'ti',
+          'returnedUnits.total_count',
+        )})`,
+        'revenue',
+      )
+      .addSelect(
+        `SUM(${this.getCostExpression(
+          'ti',
+          'returnedUnits.restocked_count',
+        )})`,
+        'cost',
+      )
+      .groupBy('day')
+      .orderBy('day', 'ASC')
+      .getRawMany<{ day: string; revenue: string; cost: string }>();
+
+    const map = new Map<string, number>();
+    for (const row of rows) {
+      const key = this.formatDate(row.day);
+      const revenue = Number(row.revenue || 0);
+      const cost = Number(row.cost || 0);
+      map.set(key, revenue - cost);
+    }
+
+    return range.days.map((day) => ({
+      date: day,
+      total: +((map.get(day) ?? 0).toFixed(2)),
+    }));
+  }
+
+  private async loadProfitYearly() {
+    const months = this.buildLastMonthsRange(12);
+    const qb = this.transactionItemRepo
+      .createQueryBuilder('ti')
+      .innerJoin('ti.transaction', 't')
+      .where('t.date >= :start', { start: months[0].start });
+    this.applyReturnUnitJoin(qb, 'returnedUnits');
+    const rows = await qb
+      .select("DATE_FORMAT(t.date, '%Y-%m')", 'period')
+      .addSelect(
+        `SUM(${this.getRevenueExpression(
+          'ti',
+          'returnedUnits.total_count',
+        )})`,
+        'revenue',
+      )
+      .addSelect(
+        `SUM(${this.getCostExpression(
+          'ti',
+          'returnedUnits.restocked_count',
+        )})`,
+        'cost',
+      )
+      .groupBy('period')
+      .orderBy('period', 'ASC')
+      .getRawMany<{ period: string; revenue: string; cost: string }>();
+
+    const map = new Map<string, number>();
+    for (const row of rows) {
+      const revenue = Number(row.revenue || 0);
+      const cost = Number(row.cost || 0);
+      map.set(row.period, revenue - cost);
+    }
+
+    return months.map((month) => ({
+      period: month.label,
+      total: +((map.get(month.label) ?? 0).toFixed(2)),
     }));
   }
 
@@ -408,11 +802,16 @@ export class StatsService {
 
   private async loadSalesDaily() {
     const range = this.buildLast7DaysRange();
-    const rows = await this.transactionRepo
+    const qb = this.transactionRepo
       .createQueryBuilder('t')
+      .where('t.date >= :from', { from: range.start });
+    this.applyReturnTotalsJoin(qb, 'returnStats');
+    const rows = await qb
       .select(`DATE(t.date)`, 'day')
-      .addSelect('SUM(t.total)', 'total')
-      .where('t.date >= :from', { from: range.start })
+      .addSelect(
+        `SUM(${this.getNetTransactionTotalExpression('returnStats')})`,
+        'total',
+      )
       .groupBy('day')
       .orderBy('day', 'ASC')
       .getRawMany<{ day: string; total: string }>();
@@ -452,11 +851,16 @@ export class StatsService {
 
   private async loadSalesCurrentMonthDaily() {
     const range = this.buildCurrentMonthRange();
-    const rows = await this.transactionRepo
+    const qb = this.transactionRepo
       .createQueryBuilder('t')
+      .where('t.date >= :start', { start: range.start });
+    this.applyReturnTotalsJoin(qb, 'returnStats');
+    const rows = await qb
       .select(`DATE(t.date)`, 'day')
-      .addSelect('SUM(t.total)', 'total')
-      .where('t.date >= :start', { start: range.start })
+      .addSelect(
+        `SUM(${this.getNetTransactionTotalExpression('returnStats')})`,
+        'total',
+      )
       .groupBy('day')
       .orderBy('day', 'ASC')
       .getRawMany<{ day: string; total: string }>();
@@ -498,11 +902,16 @@ export class StatsService {
 
   private async loadSalesYearly() {
     const months = this.buildLastMonthsRange(12);
-    const rows = await this.transactionRepo
+    const qb = this.transactionRepo
       .createQueryBuilder('t')
+      .where('t.date >= :start', { start: months[0].start });
+    this.applyReturnTotalsJoin(qb, 'returnStats');
+    const rows = await qb
       .select("DATE_FORMAT(t.date, '%Y-%m')", 'period')
-      .addSelect('SUM(t.total)', 'total')
-      .where('t.date >= :start', { start: months[0].start })
+      .addSelect(
+        `SUM(${this.getNetTransactionTotalExpression('returnStats')})`,
+        'total',
+      )
       .groupBy('period')
       .getRawMany<{ period: string; total: string }>();
 

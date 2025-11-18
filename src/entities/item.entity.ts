@@ -1,6 +1,7 @@
 import { Entity, PrimaryGeneratedColumn, Column, OneToMany } from 'typeorm';
 import { TransactionItem } from './transaction-item.entity';
 import { Roll } from './roll.entity';
+import { InventoryUnit } from './inventory-unit.entity';
 
 export type ItemCategory = 'internet' | 'solar' | 'camera' | 'satellite';
 export type StockUnit = 'm' | null;
@@ -85,4 +86,7 @@ export class Item {
 
   @OneToMany(() => TransactionItem, (transactionItem) => transactionItem.item)
   transactionItems: TransactionItem[];
+
+  @OneToMany(() => InventoryUnit, (unit) => unit.item)
+  inventoryUnits: InventoryUnit[];
 }

@@ -6,7 +6,13 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { DataSource, In, Repository, DeepPartial } from 'typeorm';
+import {
+  DataSource,
+  In,
+  Repository,
+  DeepPartial,
+  EntityManager,
+} from 'typeorm';
 import { REQUEST } from '@nestjs/core';
 import { Request } from 'express';
 
@@ -15,6 +21,7 @@ import { RestockItem } from '../entities/restock-item.entity';
 import { Item } from '../entities/item.entity';
 import { Roll } from '../entities/roll.entity';
 import { Cashbox } from '../entities/cashbox.entity';
+import { InventoryUnit } from '../entities/inventory-unit.entity';
 import {
   CreateRestockDto,
   RestockLineDto,
@@ -30,8 +37,17 @@ import {
   ManualStatusState,
 } from '../payments/payment.helpers';
 import { RestockMovementsQueryDto } from './dto/restock-movements.query.dto';
+import { generatePlaceholderBarcode } from '../inventory/inventory.utils';
 
 const RECEIPT_STATUSES = ['PAID', 'PARTIAL', 'UNPAID'] as const;
+
+type PendingRestockItem = {
+  payload: Partial<RestockItem>;
+  unitCount: number;
+  rollId?: number | null;
+  serials?: string[];
+  autoSerial?: boolean;
+};
 
 @Injectable({ scope: Scope.REQUEST })
 export class RestocksService {
@@ -118,7 +134,8 @@ export class RestocksService {
       const items = await manager.getRepository(Item).findBy({ id: In(ids) });
       const itemMap = new Map(items.map((it) => [it.id, it]));
 
-      const restockItemsToCreate: Array<Partial<RestockItem>> = [];
+      const restockItemsToCreate: PendingRestockItem[] = [];
+      const providedSerials: string[] = [];
       let subtotal = 0;
 
       for (const l of concreteLines) {
@@ -138,13 +155,44 @@ export class RestocksService {
             .increment({ id: it.id }, 'stock', qty);
           it.stock = this.num3((it.stock ?? 0) + qty);
 
+          const rawSerials = Array.isArray((l as any).serials)
+            ? (l as any).serials
+            : [];
+          const cleanedSerials = rawSerials
+            .map((serial) => `${serial ?? ''}`.trim())
+            .filter(Boolean);
+          const autoSerial = !!(l as any).autoSerial;
+
+          if (!autoSerial && cleanedSerials.length !== qty) {
+            throw new BadRequestException(
+              `Provide exactly ${qty} serial numbers for "${it.name}" or enable auto generation.`,
+            );
+          }
+          if (autoSerial && cleanedSerials.length) {
+            throw new BadRequestException(
+              `Cannot supply serial numbers and enable auto generation for "${it.name}".`,
+            );
+          }
+          const uniqueSerials = new Set(cleanedSerials);
+          if (uniqueSerials.size !== cleanedSerials.length) {
+            throw new BadRequestException(
+              `Duplicate serial numbers detected for "${it.name}".`,
+            );
+          }
+          cleanedSerials.forEach((serial) => providedSerials.push(serial));
+
           restockItemsToCreate.push({
-            restock: undefined as any,
-            item: { id: it.id } as any,
-            mode: 'EACH',
-            quantity: qty,
-            length_m: null,
-            price_each: unitCost,
+            payload: {
+              restock: undefined as any,
+              item: { id: it.id } as any,
+              mode: 'EACH',
+              quantity: qty,
+              length_m: null,
+              price_each: unitCost,
+            },
+            unitCount: qty,
+            serials: cleanedSerials.length ? cleanedSerials : undefined,
+            autoSerial,
           });
           subtotal += this.num2(unitCost * qty);
         } else {
@@ -167,8 +215,9 @@ export class RestocksService {
               item: { id: it.id } as any,
               length_m: len,
               remaining_m: len,
+              cost_per_meter: unitCost,
             });
-            await manager.getRepository(Roll).save(roll);
+            const savedRoll = await manager.getRepository(Roll).save(roll);
 
             await manager
               .getRepository(Item)
@@ -176,15 +225,34 @@ export class RestocksService {
             it.stock = this.num3((it.stock ?? 0) + len);
 
             restockItemsToCreate.push({
-              restock: undefined as any,
-              item: { id: it.id } as any,
-              mode: 'METER',
-              quantity: 1,
-              length_m: len,
-              price_each: unitCost,
+              payload: {
+                restock: undefined as any,
+                item: { id: it.id } as any,
+                mode: 'METER',
+                quantity: 1,
+                length_m: len,
+                price_each: unitCost,
+              },
+              unitCount: 1,
+              rollId: savedRoll.id,
             });
             subtotal += this.num2(unitCost * len);
           }
+        }
+      }
+
+      if (providedSerials.length) {
+        const serialSet = new Set(providedSerials);
+        if (serialSet.size !== providedSerials.length) {
+          throw new BadRequestException('Duplicate serial numbers provided.');
+        }
+        const existing = await manager
+          .getRepository(InventoryUnit)
+          .count({ where: { barcode: In(Array.from(serialSet)) } });
+        if (existing > 0) {
+          throw new BadRequestException(
+            'One or more serial numbers already exist in inventory.',
+          );
         }
       }
 
@@ -266,13 +334,28 @@ export class RestocksService {
       });
       const saved = await manager.getRepository(Restock).save(restock);
 
-      for (const row of restockItemsToCreate) {
+      const savedRestockItems: Array<{
+        restockItem: RestockItem;
+        unitCount: number;
+        rollId?: number | null;
+        serials?: string[];
+      }> = [];
+
+      for (const entry of restockItemsToCreate) {
         const ri = manager.getRepository(RestockItem).create({
-          ...row,
+          ...entry.payload,
           restock: { id: saved.id } as any,
         });
-        await manager.getRepository(RestockItem).save(ri);
+        const stored = await manager.getRepository(RestockItem).save(ri);
+        savedRestockItems.push({
+          restockItem: stored,
+          unitCount: entry.unitCount,
+          rollId: entry.rollId ?? null,
+           serials: entry.serials,
+        });
       }
+
+      await this.createInventoryUnits(manager, savedRestockItems);
 
       // === NEW: capture optional payment for this purchase ===
       let paymentCashbox: Cashbox | null = null;
@@ -370,6 +453,52 @@ export class RestocksService {
         supplierName: supplierInfo.name ?? null,
       };
     });
+  }
+
+  private async createInventoryUnits(
+    manager: EntityManager,
+    entries: Array<{
+      restockItem: RestockItem;
+      unitCount: number;
+      rollId?: number | null;
+      serials?: string[];
+    }>,
+  ) {
+    if (!entries.length) return;
+    const unitRepo = manager.getRepository(InventoryUnit);
+    const unitsToSave: InventoryUnit[] = [];
+
+    for (const entry of entries) {
+      const { restockItem, unitCount, rollId, serials } = entry;
+      const itemId = restockItem.item?.id;
+      if (!itemId) continue;
+
+      const totalUnits =
+        restockItem.mode === 'EACH'
+          ? Math.max(1, unitCount || restockItem.quantity || 0)
+          : Math.max(1, unitCount || 1);
+      const costEach = this.num2(restockItem.price_each ?? 0);
+      const serialQueue = serials ? [...serials] : [];
+
+      for (let i = 0; i < totalUnits; i += 1) {
+        const serial = serialQueue.shift() ?? null;
+        unitsToSave.push(
+          unitRepo.create({
+            item: { id: itemId } as any,
+            restockItem: { id: restockItem.id } as any,
+            roll: rollId ? ({ id: rollId } as any) : null,
+            barcode: serial ?? generatePlaceholderBarcode(),
+            isPlaceholder: !serial,
+            status: 'available',
+            costEach,
+          }),
+        );
+      }
+    }
+
+    if (unitsToSave.length) {
+      await unitRepo.save(unitsToSave);
+    }
   }
 
   async listMovements(

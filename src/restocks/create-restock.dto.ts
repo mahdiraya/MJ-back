@@ -12,6 +12,7 @@ import {
   Min,
   ValidateNested,
   IsString,
+  IsBoolean,
 } from 'class-validator';
 import { ReceiptStatus } from '../entities/restock.entity';
 
@@ -87,6 +88,15 @@ export class RestockLineDto {
   @ArrayMinSize(1)
   @Type(() => Number)
   newRolls?: number[];
+
+  @IsOptional()
+  @IsArray()
+  @Type(() => String)
+  serials?: string[];
+
+  @IsOptional()
+  @IsBoolean()
+  autoSerial?: boolean;
 
   // optional costing per unit (piece or meter)
   @Type(() => Number)

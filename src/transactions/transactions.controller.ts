@@ -1,13 +1,14 @@
 import {
-  Controller,
-  UseGuards,
-  Delete,
-  Param,
-  Post,
   Body,
+  Controller,
+  Delete,
   Get,
+  Param,
   ParseIntPipe,
+  Patch,
+  Post,
   Query,
+  UseGuards,
 } from '@nestjs/common';
 import { TransactionsService } from './transactions.service';
 import { BaseController } from '../base/base.controller';
@@ -50,6 +51,14 @@ export class TransactionsController extends BaseController<
   @Post()
   override create(@Body() dto: CreateTransactionDto) {
     return this.transactionsService.createTransaction(dto);
+  }
+
+  @Patch(':id')
+  update(
+    @Param('id', ParseIntPipe) id: number,
+    @Body() dto: UpdateTransactionDto,
+  ) {
+    return this.transactionsService.updateTransaction(id, dto);
   }
 
   @Get(':id/receipt')

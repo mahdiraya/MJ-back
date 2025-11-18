@@ -5,6 +5,7 @@ import {
   IsNumber,
   Min,
   ValidateIf,
+  IsArray,
 } from 'class-validator';
 import { Type } from 'class-transformer';
 
@@ -34,6 +35,13 @@ export class CreateTransactionItemDto {
   @IsNumber({ maxDecimalPlaces: 0 })
   @Min(1)
   quantity?: number;
+
+  @ValidateIf((o) => (o.mode ?? 'EACH') === 'EACH')
+  @IsOptional()
+  @IsArray()
+  @Type(() => Number)
+  @IsInt({ each: true })
+  inventoryUnitIds?: number[];
 
   // ===== METER mode fields =====
   @ValidateIf((o) => (o.mode ?? 'EACH') === 'METER')

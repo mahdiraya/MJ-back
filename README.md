@@ -78,6 +78,45 @@ Check out a few resources that may come in handy when working with NestJS:
 - For questions and support, please visit our [Discord channel](https://discord.gg/G7Qnnhy).
 - To dive deeper and get more hands-on experience, check out our official video [courses](https://courses.nestjs.com/).
 - Deploy your application to AWS with the help of [NestJS Mau](https://mau.nestjs.com) in just a few clicks.
+
+## Inventory units backfill
+
+The API now keeps an `inventory_units` table so you can link every physical piece/roll to its restock cost and barcode. To enable it on an existing database:
+
+1. Run the migration:
+
+   ```bash
+   npx typeorm-ts-node-commonjs migration:run -d src/data-source.ts
+   ```
+
+2. Backfill historical restock lines (this auto-generates placeholder barcodes you can overwrite when you scan the real ones):
+
+   ```bash
+   npx ts-node src/scripts/backfill-inventory-units.ts
+   ```
+
+Feel free to rerun the script after importing legacy restocks; it only creates units that are still missing.
+
+### Inventory API
+
+Two helper endpoints expose the new inventory data:
+
+- `GET /inventory/items/:itemId/units?includePlaceholders=true&status=available` – list units tied to a catalog item (set `includePlaceholders` if you need the auto-generated codes).
+- `PATCH /inventory/units/:unitId/barcode` with `{ "barcode": "1234567890123" }` – assign or overwrite a barcode (send an empty string/null to revert back to placeholder mode).
+
+Responses include the linked restock line and roll (if applicable) so the UI can display provenance details.
+
+### Per-unit sales & profit tracking
+
+- Run the latest migration (after pulling) so `transaction_items` gains the `cost_each` column and the new `transaction_item_units` linking table:
+
+  ```bash
+  npx typeorm-ts-node-commonjs migration:run -d src/data-source.ts
+  ```
+
+- Every EACH-mode sale now consumes specific inventory units (FIFO) and stamps them as `sold`, recording average cost in each transaction line plus the exact unit links. If an item is missing tracked units the checkout will fail, so make sure restocks/backfills are up to date.
+- Meter (roll) sales now pick a specific roll (auto FIFO if you don’t choose one) and use that roll’s stored cost-per-meter, so COGS stays accurate for fabric/cable products.
+- The dashboard profit charts now read from those real costs (COGS). Historical transactions without cost data will show profit equal to revenue until you backfill or manually adjust them.
 - Visualize your application graph and interact with the NestJS application in real-time using [NestJS Devtools](https://devtools.nestjs.com).
 - Need help with your project (part-time to full-time)? Check out our official [enterprise support](https://enterprise.nestjs.com).
 - To stay in the loop and get updates, follow us on [X](https://x.com/nestframework) and [LinkedIn](https://linkedin.com/company/nestjs).

@@ -9,6 +9,7 @@ import {
 } from 'typeorm';
 import { Item } from './item.entity';
 import { TransactionItem } from './transaction-item.entity';
+import { InventoryUnit } from './inventory-unit.entity';
 
 const decimalTransformer = {
   to: (v: number | null) => v,
@@ -45,6 +46,18 @@ export class Roll {
   @CreateDateColumn({ type: 'datetime' })
   created_at: Date;
 
+  @Column({
+    type: 'decimal',
+    precision: 10,
+    scale: 2,
+    nullable: true,
+    transformer: decimalTransformer,
+  })
+  cost_per_meter: number | null;
+
   @OneToMany(() => TransactionItem, (ti) => ti.roll)
   transactionItems: TransactionItem[];
+
+  @OneToMany(() => InventoryUnit, (unit) => unit.roll)
+  inventoryUnits: InventoryUnit[];
 }

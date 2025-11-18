@@ -30,6 +30,10 @@ export class CreateTransactionDto {
   @IsOptional()
   customerName?: string;
 
+  @IsString()
+  @IsOptional()
+  customerPhone?: string;
+
   @Type(() => Number)
   @IsNumber({ maxDecimalPlaces: 2 })
   @IsOptional()

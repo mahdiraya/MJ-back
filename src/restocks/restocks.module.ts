@@ -12,6 +12,7 @@ import { Roll } from '../entities/roll.entity';
 import { Payment } from '../entities/payment.entity'; // if RestocksService writes payments
 import { Cashbox } from '../entities/cashbox.entity';
 import { CashboxEntry } from '../entities/cashbox-entry.entity';
+import { InventoryUnit } from '../entities/inventory-unit.entity';
 
 @Module({
   imports: [
@@ -24,6 +25,7 @@ import { CashboxEntry } from '../entities/cashbox-entry.entity';
       Payment, // keep if you're creating payments on restock
       Cashbox,
       CashboxEntry,
+      InventoryUnit,
     ]),
   ],
   controllers: [RestocksController],

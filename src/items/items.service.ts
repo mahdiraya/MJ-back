@@ -4,19 +4,23 @@ import {
   BadRequestException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { DeepPartial, Repository } from 'typeorm';
+import { DeepPartial, Repository, In } from 'typeorm';
 import { Item } from '../entities/item.entity';
 import { BaseService } from '../base/base.service';
 import { CreateItemDto } from './create-item.dto';
 import { UpdateItemDto } from './update-item.dto';
 import { Roll } from '../entities/roll.entity';
 import { LowStockQueryDto } from './dto/low-stock.query.dto';
+import { InventoryUnit } from '../entities/inventory-unit.entity';
+import { generatePlaceholderBarcode } from '../inventory/inventory.utils';
 
 @Injectable()
 export class ItemsService extends BaseService<Item> {
   constructor(
     @InjectRepository(Item) private readonly itemsRepo: Repository<Item>,
     @InjectRepository(Roll) private readonly rollsRepo: Repository<Roll>,
+    @InjectRepository(InventoryUnit)
+    private readonly inventoryRepo: Repository<InventoryUnit>,
   ) {
     super(itemsRepo);
   }
@@ -99,10 +103,38 @@ export class ItemsService extends BaseService<Item> {
     try {
       // Normalize & enforce roll-only for meter items
       const normalized = this.normalizeUnits(dto);
+      const wantsAutoSerial = !!dto.autoSerial;
 
       if (normalized.stockUnit === 'm') {
         // For meter items: ignore any incoming "stock" and compute from rolls
         normalized.stock = 0;
+        if (wantsAutoSerial) {
+          throw new BadRequestException(
+            'Auto serial generation is only supported for EACH items.',
+          );
+        }
+      }
+
+      const serials =
+        dto.initialSerials
+          ?.map((s) => `${s ?? ''}`.trim())
+          .filter((s) => !!s) || [];
+      if (serials.length && normalized.stockUnit === 'm') {
+        throw new BadRequestException(
+          'Serial numbers are only supported for EACH items.',
+        );
+      }
+      if (serials.length) {
+        normalized.stock = serials.length;
+      } else if (wantsAutoSerial && normalized.stockUnit !== 'm') {
+        normalized.stock = Math.max(
+          0,
+          Math.floor(Number(dto.stock ?? normalized.stock ?? 0)),
+        );
+      } else if ((normalized.stock ?? 0) > 0) {
+        throw new BadRequestException(
+          'Provide serial numbers or enable auto-generation for initial stock.',
+        );
       }
 
       const entity = this.itemsRepo.create(normalized as DeepPartial<Item>);
@@ -129,6 +161,50 @@ export class ItemsService extends BaseService<Item> {
         }
         saved.stock = Number(sum.toFixed(3));
         await this.itemsRepo.save(saved);
+      }
+
+      if (serials.length) {
+        const unique = Array.from(new Set(serials));
+        if (unique.length !== serials.length) {
+          throw new BadRequestException('Serial numbers must be unique.');
+        }
+        const existing = await this.inventoryRepo.count({
+          where: { barcode: In(unique) },
+        });
+        if (existing) {
+          throw new BadRequestException(
+            'One or more serial numbers are already in use.',
+          );
+        }
+        const units = serials.map((barcode) =>
+          this.inventoryRepo.create({
+            item: { id: saved.id } as any,
+            barcode,
+            isPlaceholder: false,
+            status: 'available',
+            restockItem: null,
+            costEach: 0,
+          }),
+        );
+        await this.inventoryRepo.save(units);
+      } else if (wantsAutoSerial && (normalized.stock ?? 0) > 0) {
+        const count = Math.max(
+          0,
+          Math.floor(Number(normalized.stock ?? 0)),
+        );
+        const units = Array.from({ length: count }, () =>
+          this.inventoryRepo.create({
+            item: { id: saved.id } as any,
+            barcode: generatePlaceholderBarcode(),
+            isPlaceholder: true,
+            status: 'available',
+            restockItem: null,
+            costEach: 0,
+          }),
+        );
+        if (units.length) {
+          await this.inventoryRepo.save(units);
+        }
       }
 
       return await this.itemsRepo.findOneOrFail({

@@ -10,6 +10,7 @@ import {
 import { Restock } from './restock.entity';
 import { Item } from './item.entity';
 import { RestockRoll } from './restock-roll.entity';
+import { InventoryUnit } from './inventory-unit.entity';
 
 // keep decimals as numbers in JS
 const dec2 = {
@@ -83,4 +84,7 @@ export class RestockItem {
   /** Inverse side for per-roll details */
   @OneToMany(() => RestockRoll, (rr) => rr.restockItem, { cascade: true })
   rolls!: RestockRoll[];
+
+  @OneToMany(() => InventoryUnit, (unit) => unit.restockItem)
+  inventoryUnits!: InventoryUnit[];
 }

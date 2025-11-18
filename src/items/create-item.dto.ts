@@ -8,6 +8,9 @@ import {
   IsArray,
   IsNumberOptions,
   ValidateIf,
+  ArrayMaxSize,
+  ArrayNotEmpty,
+  IsBoolean,
 } from 'class-validator';
 import { Type } from 'class-transformer';
 import { ItemCategory, StockUnit } from '../entities/item.entity';
@@ -84,4 +87,13 @@ export class CreateItemDto {
   @ValidateIf((o) => o.stockUnit === 'm')
   @Type(() => Number)
   initialRolls?: number[];
+
+  @IsOptional()
+  @IsArray()
+  @ArrayNotEmpty()
+  initialSerials?: string[];
+
+  @IsOptional()
+  @IsBoolean()
+  autoSerial?: boolean;
 }
