@@ -16,7 +16,6 @@ import { UpdateUserDto } from './update-user.dto';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { RolesGuard } from '../auth/roles.guard';
 import { Roles } from '../auth/roles.decorator';
-import { Public } from '../auth/public.decorator';
 
 @Controller('users')
 @UseGuards(JwtAuthGuard, RolesGuard)
@@ -30,8 +29,8 @@ export class UsersController extends BaseController<
     super(usersService);
   }
 
-  /** Public registration endpoint (hashes password). */
-  @Public()
+  /** Admin registration endpoint (hashes password). */
+  @Roles('admin')
   @Post('register')
   async register(
     @Body()

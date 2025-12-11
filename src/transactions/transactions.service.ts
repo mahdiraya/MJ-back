@@ -81,6 +81,15 @@ type SalePlan = {
   note?: string | null;
 };
 
+export type RecordSalePaymentDto = {
+  amount: number;
+  cashboxId?: number;
+  cashboxCode?: string;
+  paymentDate?: string;
+  paymentNote?: string;
+  payMethod?: string;
+};
+
 @Injectable({ scope: Scope.REQUEST })
 export class TransactionsService extends BaseService<Transaction> {
   constructor(
@@ -900,6 +909,87 @@ export class TransactionsService extends BaseService<Transaction> {
 
   async getReceipt(id: number): Promise<any> {
     return this.buildTransactionResponse(this.repo.manager, id);
+  }
+
+  async recordPayment(
+    transactionId: number,
+    dto: RecordSalePaymentDto,
+  ): Promise<any> {
+    const amount = this.num2(dto.amount);
+    if (!(amount > 0)) {
+      throw new BadRequestException('Payment amount must be greater than zero.');
+    }
+
+    return this.dataSource.transaction(async (manager) => {
+      const tx = await manager.getRepository(Transaction).findOne({
+        where: { id: transactionId },
+        lock: { mode: 'pessimistic_write' },
+      });
+      if (!tx) {
+        throw new NotFoundException('Transaction not found');
+      }
+
+      const cashbox = await resolveCashboxFromDto(manager, dto as any);
+      if (!cashbox) {
+        throw new BadRequestException(
+          'Providing a payment requires a valid cashbox.',
+        );
+      }
+
+      const paymentRepo = manager.getRepository(Payment);
+      const payEntity = paymentRepo.create({
+        kind: 'sale',
+        amount,
+        transaction: { id: transactionId } as any,
+        note: dto.paymentNote ?? null,
+        cashbox: { id: cashbox.id } as any,
+      } as DeepPartial<Payment>);
+      const savedPayment = await paymentRepo.save(payEntity);
+
+      const entryRepo = manager.getRepository(CashboxEntry);
+      const meta = dto.payMethod ? { method: dto.payMethod } : null;
+      const entry = entryRepo.create({
+        cashbox: { id: cashbox.id } as any,
+        kind: 'payment',
+        direction: 'in',
+        amount,
+        payment: { id: savedPayment.id } as any,
+        referenceType: 'sale',
+        referenceId: transactionId,
+        occurredAt: dto.paymentDate ? new Date(dto.paymentDate) : new Date(),
+        note: dto.paymentNote ?? null,
+        meta,
+      });
+      await entryRepo.save(entry);
+
+      const paidRow = await paymentRepo
+        .createQueryBuilder('p')
+        .select('COALESCE(SUM(p.amount), 0)', 'sum')
+        .where('p.kind = :kind', { kind: 'sale' })
+        .andWhere('p.transaction = :txId', { txId: transactionId })
+        .getRawOne<{ sum?: string }>();
+      const paid = this.num2(Number(paidRow?.sum ?? 0));
+
+      const manualState: ManualStatusState<ReceiptStatus> = {
+        enabled: !!tx.statusManualEnabled,
+        value: tx.statusManualValue,
+        note: tx.statusManualNote ?? null,
+      };
+      const statusCode = computeReceiptStatus<ReceiptStatus>(
+        paid,
+        tx.total ?? 0,
+        manualState,
+        (n) => this.num2(n),
+        TRANSACTION_STATUSES,
+      );
+      if (tx.status !== statusCode) {
+        await manager
+          .getRepository(Transaction)
+          .update(tx.id, { status: statusCode });
+      }
+
+      return this.buildTransactionResponse(manager, transactionId);
+    });
   }
 
   async findAllWithPeople(): Promise<Partial<Transaction>[]> {

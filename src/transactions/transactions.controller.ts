@@ -19,6 +19,7 @@ import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { RolesGuard } from '../auth/roles.guard';
 import { Roles } from '../auth/roles.decorator';
 import { TransactionMovementsQueryDto } from './dto/transaction-movements.query.dto';
+import { RecordSalePaymentDto } from './transactions.service';
 
 @UseGuards(JwtAuthGuard, RolesGuard)
 @Controller('transactions')
@@ -69,6 +70,14 @@ export class TransactionsController extends BaseController<
   @Get('receipt/:id')
   getReceiptAlt(@Param('id', ParseIntPipe) id: number) {
     return this.transactionsService.getReceipt(id);
+  }
+
+  @Post(':id/payments')
+  addPayment(
+    @Param('id', ParseIntPipe) id: number,
+    @Body() dto: RecordSalePaymentDto,
+  ) {
+    return this.transactionsService.recordPayment(id, dto);
   }
 
   /** Lightweight history endpoints (no items), newest first */
